@@ -43,5 +43,62 @@ module EffectiveAssets
       end
     end
 
+    # Rails 7.2 compatibility: Patch serialize method to handle old API
+    initializer 'effective_assets.rails72_serialize_compat' do |app|
+      app.config.to_prepare do
+        # Monkey patch to fix serialize method for Rails 7.2 compatibility
+        # In Rails 7.2, serialize changed from serialize(attr, coder) to serialize(attr, coder: coder)
+        # This patch allows the old API to work by converting it to the new API
+        module SerializeRails72Compat
+          def serialize(attr_name, *args, **options)
+            # If a second positional argument is provided (old API), convert it to keyword argument
+            options[:coder] = args.first if args.length > 0 && !options.key?(:coder) && args.first
+
+            # Rails 7.2 signature: serialize(attr_name, coder: nil, type: Object, comparable: false, yaml: {}, **options)
+            # We must explicitly call the parent method with ONLY attr_name as positional and everything else as keywords
+            # Using method() to get the original method and call it directly to avoid super forwarding issues
+            original_method = method(:serialize).super_method
+            if options.any?
+              original_method.call(attr_name, **options)
+            else
+              original_method.call(attr_name)
+            end
+          end
+        end
+
+        # Patch build_column_serializer to handle coder initialization errors
+        module BuildColumnSerializerPatch
+          def build_column_serializer(name, coder, type, yaml)
+            # Rails 7.2 may try to instantiate coders with 2 arguments, but some only accept 0-1
+            # Wrap the call to handle ArgumentError gracefully
+
+            super
+          rescue ArgumentError => e
+            raise unless e.message.include?('wrong number of arguments') && coder.is_a?(Class)
+
+            # If it's a class coder and initialization fails, try creating an instance first
+            coder_instance = begin
+              # Try with no arguments
+              coder.new
+            rescue ArgumentError
+              begin
+                # Try with one argument
+                coder.new(name)
+              rescue ArgumentError
+                # If both fail, use the class itself (Rails should handle this)
+                coder
+              end
+            end
+            # Retry with the instance instead of the class
+            super(name, coder_instance, type, yaml)
+          end
+        end
+
+        # Prepend both modules
+        ActiveRecord::AttributeMethods::Serialization::ClassMethods.prepend(SerializeRails72Compat)
+        ActiveRecord::AttributeMethods::Serialization::ClassMethods.prepend(BuildColumnSerializerPatch)
+      end
+    end
+
   end
 end
